@@ -1,0 +1,51 @@
+# role = chain of backends, tried left to right on failure, separated by " | "
+#   claude:<model>        claude CLI native      (sonnet|opus|haiku or full id)
+#   opencode:<prov/model> opencode CLI           (needs opencode installed)
+#   oai:<alias>           direct gateway chat call, no tools (critic/reviewer/chores)
+#   cp:<model>            claude CLI through a cliproxy-style proxy (cp.env; see HARNESS_CP_PREFIX)
+#   gw:<alias>            claude CLI via an Anthropic-compatible gateway (needs HARNESS_GW_URL, HARNESS_GW_KEY in env)
+# Append @family to override the guessed model family, e.g. gw:expensive@glm
+# role.avoid = roles whose served family must NOT be used (independence rule)
+# role.tools = tools allowed for claude/gw backends
+# role.hooks = off: run claude/gw/cp backends with all hooks disabled (use for read-only roles, so the nested session never fires your Stop/SessionEnd hooks)
+# role.mcp   = MCP server (file $HARNESS_HOME/mcp/<name>.json) for claude/gw backends; oai: roles have no tools. The role.mcp lines below are commented out: copy mcp/rag.json.example, point it at your server, then uncomment.
+
+# cp:<model> entries (Claude Code through a cliproxy-style proxy, see cp.env.example) are left out of this example; put them in front of the claude: entries once cp.env works.
+# planner = Opus by default; Sonnet is the last fallback.
+planner=claude:claude-opus-5-5 | claude:opus | claude:sonnet
+# planner.mcp=rag
+planner.tools=Read,Grep,Glob,WebSearch,WebFetch
+planner.hooks=off
+
+critic=claude:claude-opus-5-5 | claude:opus
+# critic = Opus. A non-Claude critic also works (e.g. oai:critic@glm); streaming keeps slow reasoning models alive.
+# No critic.avoid=planner: planner and critic may be the same model; the critic is independent of the planner's context, not of its family. Add critic.avoid=planner to force a different family.
+# critic.mcp=rag
+critic.tools=Read,Grep,Glob,WebSearch,WebFetch
+critic.hooks=off
+
+coder=claude:sonnet
+# coder.mcp=rag
+coder.tools=Read,Grep,Glob,Edit,Write,Bash
+
+# reviewer = fresh Opus, independent of the coder's context. The coder is Sonnet, so reviewer.avoid=coder does not skip it.
+# Add a different-family backend (e.g. oai:reviewer@glm) as the last fallback if you want one.
+reviewer=claude:claude-opus-5-5 | claude:opus
+reviewer.avoid=coder
+# reviewer.mcp=rag
+reviewer.tools=Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)
+reviewer.hooks=off
+
+# auditor = final missed-work + security pass after tests are green.
+# Independent of context, not of family (coder Sonnet, auditor Opus: same vendor, so avoid=coder rarely fires).
+auditor=claude:claude-opus-5-5 | claude:opus
+auditor.avoid=coder
+# auditor.mcp=rag
+auditor.tools=Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*)
+auditor.hooks=off
+
+chores=claude:haiku
+chores.tools=Read,Grep,Glob
+chores.hooks=off
+
+# Escalation (not auto): re-run any role with HARNESS_OVERRIDE='claude:opus' harness-run ...

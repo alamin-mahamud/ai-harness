@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# PreToolUse hook on ExitPlanMode: send the plan to the harness critic (fresh context; it may be the same model
+# family as the author, so it is independent of context, not of family) before the user sees it.
+# REVISE/REJECT -> exit 2, findings go back to Claude to fold in.
+# Max MAX_ROUNDS (2) gated critic rounds per plan; the next call passes without another review and the user decides.
+# The round counter resets whenever the gate passes (APPROVE or limit), so the next plan in the session starts at 1.
+# Off switch: HARNESS_PLAN_GATE=off
+# The critic call is wrapped in `timeout` (HARNESS_GATE_TIMEOUT seconds, default 540; needs coreutils `timeout`).
+# Keep it below the hook timeout in settings.json (600): on expiry the plan passes with a "critic unavailable" notice.
+set -uo pipefail
+[ "${HARNESS_PLAN_GATE:-on}" = off ] && exit 0
+command -v jq >/dev/null || { printf '{"systemMessage":"Plan gate: jq missing, plan NOT reviewed"}\n'; exit 0; }
+in="$(cat)"
+plan="$(jq -r '.tool_input.plan // empty' <<<"$in")"
+[ -n "$plan" ] || exit 0
+sid="$(jq -r '.session_id // "nosession"' <<<"$in" | cut -c1-8)"
+cwd="$(jq -r '.cwd // empty' <<<"$in")"
+H="${HARNESS_HOME:-$HOME/.claude/harness}"
+
+# Section lint (cheap, before spending a critic call). The rule lives in the principles dir (via harness-principles).
+# Plan needs the sections listed in the principles frontmatter (plan_sections); trivial change may say "Baseline: n/a - <reason>".
+# No principles configured or no plan_sections listed: the lint is skipped (a warning is printed on stderr).
+# Off switch: HARNESS_BASELINE_GATE=off
+if [ "${HARNESS_BASELINE_GATE:-on}" != off ]; then
+  missing=""
+  secs="$("$H/bin/harness-principles" sections 2>/dev/null)" || secs=""
+  [ -n "${secs//[[:space:]]/}" ] || echo "plan-gate-hook: WARN no plan_sections from the principles dir (HARNESS_PRINCIPLES_DIR); section lint skipped" >&2
+  for sec in $secs; do
+    grep -qiE "^[#*[:space:]0-9.]*${sec}\b" <<<"$plan" || missing="$missing $sec"
+  done
+  if [ -n "$missing" ] && ! grep -qiE '^[#*[:space:]]*baseline:?\**[[:space:]]*n/a' <<<"$plan"; then
+    {
+      echo "Plan gate: plan lacks required house-principle section(s):$missing."
+      echo "Standard: the house principles in HARNESS_PRINCIPLES_DIR (default ~/.claude/principles)."
+      echo "Gather the evidence and capture the baseline first (a plan may be only that). Trivial one-step change: add 'Baseline: n/a - <reason>'. Then call ExitPlanMode again."
+    } >&2
+    exit 2
+  fi
+fi
+
+MAX_ROUNDS=2
+# Keyed on session only (a date in the key reset the count at UTC midnight); one dir per session, rounds file per plan.
+run="$H/runs/plan-$sid"; mkdir -p "$run"
+round=$(( $(cat "$run/rounds" 2>/dev/null || echo 0) + 1 )); echo "$round" > "$run/rounds"
+gate_pass() { echo 0 > "$run/rounds"; }   # next plan in this session starts at round 1
+if [ "$round" -gt "$MAX_ROUNDS" ]; then
+  gate_pass
+  jq -nc --arg m "Plan gate: $MAX_ROUNDS critic rounds done; plan shown without another review. Last review: $run/critic.md" '{systemMessage:$m}'
+  exit 0
+fi
+
+{ echo "Plan written by an interactive Claude Code session (round $round)."
+  echo "Working directory: ${cwd:-unknown}"
+  echo "You can read files (Read, Grep, Glob) and search the web, but cannot run commands or reach live systems. Verify what you can in the repo; flag every claim about live state that the plan states without evidence."; } > "$run/task.md"
+printf '%s\n' "$plan" > "$run/planner.r$round.md"
+cp "$run/planner.r$round.md" "$run/planner.md"
+
+gt="${HARNESS_GATE_TIMEOUT:-540}"; tmo=(); command -v timeout >/dev/null && tmo=(timeout "$gt")
+verdict="$("${tmo[@]}" "$H/bin/harness-run" critic "$run" "$run/task.md" "$run/planner.md" 2>"$run/gate.err")"; rc=$?
+[ "$rc" -eq 124 ] && echo "harness-run timed out after ${gt}s" >> "$run/gate.err"
+if [ $rc -ne 0 ] || [ ! -s "$run/critic.md" ]; then
+  gate_pass
+  jq -nc --arg e "$(tail -3 "$run/gate.err" | tr '\n' ' ')" '{systemMessage:("Plan gate: critic unavailable, plan NOT independently reviewed. " + $e)}'
+  exit 0
+fi
+cp "$run/critic.md" "$run/critic.r$round.md"
+served="$(jq -r .served "$run/critic.meta")"
+# Configured = model part of the first critic= entry; cp: and claude: of the same model both count.
+head="$(grep -E '^critic=' "$H/roles.conf" | head -1 | cut -d= -f2- | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//' | cut -d'|' -f1 | xargs)"
+note=""; [ "${served#*:}" = "${head#*:}" ] || note=" (fallback: $served, configured $head)"
+
+# Only a verdict line that is exactly "VERDICT: APPROVE" passes; "REVISE (would APPROVE ...)" or the echoed template bounce.
+[[ "$verdict" =~ ^VERDICT:[[:space:]]*APPROVE[[:space:]]*$ ]] && vk=approve || vk=other
+case "$vk" in
+  approve)
+    gate_pass
+    jq -nc --arg m "Plan gate: $served$note -> APPROVE. Review: $run/critic.md" '{systemMessage:$m}'
+    exit 0 ;;
+  *)
+    {
+      echo "Independent critic ($served$note), round $round of $MAX_ROUNDS: ${verdict:-no verdict line}."
+      echo "Fold the blocking findings into the plan, or state in the plan why a finding is wrong (with evidence). Then call ExitPlanMode again."
+      echo "Show the user the final verdict and what changed. Full review: $run/critic.md"
+      echo
+      head -c 12000 "$run/critic.md"
+    } >&2
+    [ "$round" -eq "$MAX_ROUNDS" ] && { echo; echo "(Last gated round: the next ExitPlanMode passes without another review; the user decides.)"; } >&2
+    exit 2 ;;
+esac

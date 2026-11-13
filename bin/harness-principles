@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Single reader for the house principles: every *.md file in HARNESS_PRINCIPLES_DIR
+# (default ~/.claude/principles; the older name HARNESS_PRINCIPLES is still honoured).
+# An empty HARNESS_PRINCIPLES_DIR means "no principles": this script exits 1 and harness-run warns.
+#   harness-principles text            principles, frontmatter stripped (injected into role prompts)
+#   harness-principles sections        plan_sections list from frontmatter (for plan-gate-hook lint)
+set -euo pipefail
+P="${HARNESS_PRINCIPLES_DIR-${HARNESS_PRINCIPLES-$HOME/.claude/principles}}"
+[ -n "$P" ] || { echo "harness-principles: HARNESS_PRINCIPLES_DIR is empty (no principles configured)" >&2; exit 1; }
+files=("$P"/*.md)
+[ -e "${files[0]}" ] || { echo "harness-principles: no principles in $P" >&2; exit 1; }
+strip() { awk 'BEGIN{fm=0} NR==1&&/^---$/{fm=1;next} fm&&/^---$/{fm=0;next} !fm' "$1"; }
+case "${1:-text}" in
+  text) for f in "${files[@]}"; do strip "$f"; echo; done ;;
+  sections) for f in "${files[@]}"; do sed -n '1,/^---$/{s/^plan_sections:[[:space:]]*//p}' "$f"; done | paste -sd, - | tr ',' ' ' ;;
+  *) echo "usage: harness-principles text|sections" >&2; exit 2 ;;
+esac

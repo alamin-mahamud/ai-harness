@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# harness-run <role> <rundir> [input-file ...]
+# Writes <rundir>/<role>.md, <rundir>/<role>.meta (served backend+family), appends $HARNESS_HOME/log.jsonl
+set -uo pipefail
+H="${HARNESS_HOME:-$HOME/.claude/harness}"
+# shellcheck source=/dev/null
+[ -f "$H/gw.env" ] && . "$H/gw.env"
+# shellcheck source=/dev/null
+[ -f "$H/cp.env" ] && . "$H/cp.env"
+
+# Pre-send secret scan. Patterns are written from the vendors' token-format docs and adapted from the MIT-licensed
+# gitleaks rules (github.com/gitleaks/gitleaks, config/gitleaks.toml; see NOTICE). Prefix-anchored on purpose:
+# bare N-char patterns false-positive on hashes and words.
+# Which backends are scanned is decided by the BACKEND KIND, never by the model name or an @family override:
+# claude: and cp: skip the scan (your own Claude login / your own trusted proxy); gw:, oai: and opencode: are always scanned.
+# The scan needs GNU grep -P; without it harness-run exits 4 before any scanned backend runs (fail closed).
+# Prints the pattern NAME of the first hit (never the matched text). Off switch: HARNESS_SECRET_SCAN=off
+# Sources: gitleaks rules for aws_access_key_id, github_token (github_pat_), slack_token, npm_token, google_api_key,
+# private_key, huggingface_token, jwt; vendor docs for the rest (GitLab prefix list: docs.gitlab.com/security/tokens/,
+# GitHub/OpenAI/Anthropic/Cloudflare/AWS token-format docs).
+SECRET_PATTERNS=(
+  'aws_access_key_id|\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}\b'
+  'aws_secret_access_key|(?i)aws[_-]?secret[_-]?(?:access[_-]?)?key["'"'"'\s]*[:=]["'"'"'\s]*[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])'
+  'github_token|\bgh[pousr]_[A-Za-z0-9]{36}\b|\bgithub_pat_\w{82}\b'
+  'gitlab_token|\bgl(?:pat|oas|dt|rtr?|cbt|ptt|ft|imt|agent|soat|wt|ffct)-[\w-]{20,}'
+  'llm_api_key|\bsk-ant-[A-Za-z0-9]{3,10}-[\w-]{60,}|\bsk-(?:proj|svcacct|admin)-[\w-]{40,}|\bsk-or-v1-[0-9a-f]{64}\b|\bsk-[A-Za-z0-9]{40,}\b'
+  'huggingface_token|\bhf_[A-Za-z]{34}\b'
+  'slack_token|\bxox[bpe]-[0-9]{8,13}-[0-9]{8,13}(?:-[0-9]{8,13})?-[A-Za-z0-9-]{12,}|\bxapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-z0-9]+'
+  'npm_token|(?i)\bnpm_[a-z0-9]{36}\b'
+  'google_api_key|\bAIza[\w-]{35}(?![\w-])'
+  'cloudflare_token|\bcf(?:ut|at)_[A-Za-z0-9]{36,}'
+  'private_key|-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY'
+  'jwt|\bey[A-Za-z0-9]{17,}\.ey[A-Za-z0-9/\\_-]{17,}\.[A-Za-z0-9/\\_=-]{10,}'
+  'stripe_key|\b[rs]k_live_[A-Za-z0-9]{20,}'
+  'url_credentials|[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]{3,}@'
+  'basic_auth|(?i)\bbasic[ \t]+[A-Za-z0-9+/]{16,}={0,2}'
+  'bearer_token|(?i)\bbearer[ \t]+[A-Za-z0-9._~+/=-]{20,}'
+)
+# The configured gateway and proxy keys are also matched literally (any prompt that contains them is a hit).
+SCAN_LITERALS=()
+[ -n "${HARNESS_GW_KEY:-}" ] && SCAN_LITERALS+=("$HARNESS_GW_KEY")
+[ -r "${HARNESS_CP_KEY_FILE:-}" ] && SCAN_LITERALS+=("$(tr -d '[:space:]' < "$HARNESS_CP_KEY_FILE")")
+grep_p_ok() { printf 'ab\n' | grep -qP '(?i)A(?!c)B' 2>/dev/null; }
+need_grep_p() { grep_p_ok || { echo "harness-run: the secret scan needs GNU grep with -P (macOS: brew install grep and put it first on PATH); refusing to run a scanned backend without it. HARNESS_SECRET_SCAN=off disables the scan." >&2; exit 4; }; }
+secret_scan() { # stdin -> prints first matching pattern name, rc 0 if found, 1 if clean. A grep error counts as a hit (fail closed).
+  local text p k rc; text="$(cat)"
+  for p in "${SECRET_PATTERNS[@]}"; do
+    grep -qP -- "${p#*|}" <<<"$text"; rc=$?
+    case "$rc" in 0) echo "${p%%|*}"; return 0;; 1) ;; *) echo "scan_error"; return 0;; esac
+  done
+  for k in "${SCAN_LITERALS[@]}"; do
+    [ "${#k}" -ge 8 ] && grep -qF -- "$k" <<<"$text" && { echo "configured_gateway_key"; return 0; }
+  done
+  return 1
+}
+if [ "${1:-}" = --scan ]; then   # harness-run --scan <file...>: exit 1 + name if a file has a secret pattern (for tests/replays)
+  shift; rc=0; need_grep_p
+  for f in "$@"; do
+    [ -r "$f" ] || { echo "missing file: $f" >&2; exit 2; }
+    hit="$(secret_scan < "$f")" && { echo "$f: $hit"; rc=1; }
+  done
+  exit $rc
+fi
+role="${1:?role}"; run="${2:?rundir}"; shift 2
+mkdir -p "$run"
+
+# value of key $1 in roles.conf; a trailing "  # comment" and trailing spaces are not part of the value
+conf() { grep -E "^$1=" "$H/roles.conf" | head -1 | cut -d= -f2- | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//'; }
+chain="${HARNESS_OVERRIDE:-$(conf "$role")}"; [ -n "$chain" ] || { echo "no role: $role" >&2; exit 2; }
+tools="$(conf "$role.tools")"; avoid="$(conf "$role.avoid")"
+mcp="$(conf "$role.mcp")"   # optional: MCP server name -> $H/mcp/<name>.json (claude/gw backends only)
+claude_flags="${HARNESS_CLAUDE_FLAGS:---no-session-persistence --disable-slash-commands --strict-mcp-config --setting-sources project}"
+# role.hooks=off: nested `claude -p` runs no hooks from any settings source. Without it a read-only role run from a
+# project checkout fires that project's Stop/SessionEnd hooks, which can commit or push.
+# disableAllHooks drops only hooks; project permissions and plugins still load. The coder keeps hooks (lint, guard).
+iso_flags=(); [ "$(conf "$role.hooks")" = off ] && iso_flags=(--settings '{"disableAllHooks":true}')
+
+# plain https, or http only for a loopback host (the Bearer key must not cross the network in cleartext)
+# allow-list: https anywhere, http only for a bare loopback host (a "user@host" suffix like http://localhost:1@evil does not match)
+url_ok() { [[ "$1" == https://* ]] || [[ "$1" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$) ]]; }
+# curl config line carrying the Bearer key, fed through stdin (-K -) so the key never appears in argv / ps
+curl_auth_cfg() { local k="$1"; k="${k//\\/\\\\}"; k="${k//\"/\\\"}"; printf 'header = "Authorization: Bearer %s"\n' "$k"; }
+
+family() { # backend-spec -> family
+  local s="$1"; [[ "$s" == *@* ]] && { echo "${s##*@}"; return; }
+  case "$s" in claude:*|cp:*) echo "claude-${s#*:}"; return;; esac
+  local m="${s#*:}"; m="${m##*/}"; echo "$m" | tr '[:upper:]' '[:lower:]' | sed -E 's/^([a-z]+).*/\1/'
+}
+
+ptxt="$("$H/bin/harness-principles" text 2>/dev/null || true)"
+pok=true; [ -n "${ptxt//[[:space:]]/}" ] || { pok=false; echo "WARN: house principles text is EMPTY (check HARNESS_PRINCIPLES_DIR, default ~/.claude/principles); $role runs without them" >&2; [ "${HARNESS_PRINCIPLES_REQUIRED:-off}" = on ] && { echo "refusing: HARNESS_PRINCIPLES_REQUIRED=on" >&2; exit 3; }; }
+[ -r "$H/prompts/$role.md" ] || { echo "missing role prompt: $H/prompts/$role.md" >&2; exit 2; }
+for f in "$@"; do [ -r "$f" ] || { echo "missing input file: $f" >&2; exit 2; }; done
+prompt="$(cat "$H/prompts/$role.md")"$'\n\n# House principles (follow them)\n'"$ptxt"$'\n\n# Inputs\n'
+for f in "$@"; do prompt+=$'\n## '"$f"$'\n'"$(cat "$f")"$'\n'; done
+
+avoid_fams=""
+for a in $avoid; do [ -f "$run/$a.meta" ] && avoid_fams+=" $(jq -r .family "$run/$a.meta")"; done
+
+skipped=(); unset scan_hit
+IFS='|' read -ra specs <<< "$chain"
+for raw in "${specs[@]}"; do
+  spec="$(echo "$raw" | xargs)"; fam="$(family "$spec")"
+  if [[ " $avoid_fams " == *" $fam "* ]]; then echo "skip $spec (family $fam == avoided)" >&2; continue; fi
+  kind="${spec%%:*}"; model="${spec#*:}"; model="${model%@*}"
+  case "$kind" in claude|cp) ;; *)   # gw:/oai:/opencode: = prompt leaves for a third party: never send secrets; chain falls through to the next entry
+    if [ "${HARNESS_SECRET_SCAN:-on}" != off ]; then
+      [ -n "${scan_ready+x}" ] || { need_grep_p; scan_ready=1; }
+      [ -n "${scan_hit+x}" ] || scan_hit="$(printf '%s' "$prompt" | secret_scan || true)"
+      if [ -n "$scan_hit" ]; then echo "skip $spec (secret pattern '$scan_hit' in prompt; scanned backend)" >&2; skipped+=("secret:$scan_hit"); continue; fi
+    fi ;;
+  esac
+  out="$run/$role.md"; cost=null; t0=$(date +%s)
+  case "$kind" in
+    claude|gw|cp)
+      envs=()
+      if [ "$kind" = gw ]; then
+        { [ -n "${HARNESS_GW_URL:-}" ] && [ -n "${HARNESS_GW_KEY:-}" ]; } || { echo "fail $spec (set HARNESS_GW_URL and HARNESS_GW_KEY)" >&2; continue; }
+        url_ok "$HARNESS_GW_URL" || { echo "fail $spec (refusing non-https HARNESS_GW_URL)" >&2; continue; }
+        envs=(ANTHROPIC_BASE_URL="$HARNESS_GW_URL" ANTHROPIC_AUTH_TOKEN="$HARNESS_GW_KEY")
+        [ -z "${HARNESS_GW_CA:-}" ] || envs+=(NODE_EXTRA_CA_CERTS="$HARNESS_GW_CA")   # private-CA gateway: the nested claude needs the CA too
+      fi
+      if [ "$kind" = cp ]; then   # Claude Code through a cliproxy-style proxy; HARNESS_CP_PREFIX (default empty) is prepended to the model id
+        [ -r "${HARNESS_CP_KEY_FILE:-}" ] || { echo "fail $spec (no cliproxy key file)" >&2; continue; }
+        [ -n "${HARNESS_CP_URL:-}" ] || { echo "fail $spec (set HARNESS_CP_URL)" >&2; continue; }
+        url_ok "$HARNESS_CP_URL" || { echo "fail $spec (refusing non-https HARNESS_CP_URL)" >&2; continue; }
+        cp_key="$(tr -d '[:space:]' < "$HARNESS_CP_KEY_FILE")"; cp_pfx="${HARNESS_CP_PREFIX:-}"
+        cp_ca=(); cp_node_ca=(); [ -n "${HARNESS_CP_CA:-}" ] && { cp_ca=(--cacert "$HARNESS_CP_CA"); cp_node_ca=(NODE_EXTRA_CA_CERTS="$HARNESS_CP_CA"); }
+        # The CLI retries a dead endpoint for minutes; check first so the chain falls through to the direct backend at once.
+        curl_auth_cfg "$cp_key" | curl -sS -m 3 -K - "${cp_ca[@]}" -o /dev/null "$HARNESS_CP_URL/v1/models" 2>"$run/$role.err" || { echo "fail $spec (cliproxy unreachable)" >&2; continue; }
+        case "$model" in sonnet) model=claude-sonnet-5-5;; opus) model=claude-opus-5-5;; haiku) model=claude-haiku-5-5;; esac
+        envs=(ANTHROPIC_BASE_URL="$HARNESS_CP_URL" ANTHROPIC_API_KEY="$cp_key" "${cp_node_ca[@]}"
+              ANTHROPIC_DEFAULT_SONNET_MODEL="${cp_pfx}claude-sonnet-5-5" ANTHROPIC_DEFAULT_OPUS_MODEL="${cp_pfx}claude-opus-5-5" ANTHROPIC_DEFAULT_HAIKU_MODEL="${cp_pfx}claude-haiku-5-5")
+        model="${cp_pfx}${model}"
+      fi
+      tf=(); mf=(); t_eff="$tools"
+      if [ -n "$mcp" ]; then
+        [ -f "$H/mcp/$mcp.json" ] || { echo "no mcp config $H/mcp/$mcp.json" >&2; continue; }
+        mf=(--mcp-config "$H/mcp/$mcp.json"); t_eff="${t_eff:+$t_eff,}mcp__$mcp"   # strict-mcp-config still on: only this server
+      fi
+      [ -n "$t_eff" ] && tf=(--allowedTools "$t_eff")
+      # shellcheck disable=SC2086  # claude_flags is a deliberate word-split list of flags
+      # Child env is set inside a subshell (no key in argv). gw:/cp: first drop inherited Anthropic creds so they cannot reach
+      # the gateway host; every child loses the gateway/proxy key variables (the coder has Bash, the others may Read).
+      js="$(
+        [ "$kind" = claude ] || unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_OAUTH_TOKEN
+        unset HARNESS_GW_KEY HARNESS_CP_KEY_FILE
+        # shellcheck disable=SC2163  # each element is a NAME=value assignment
+        for kv in "${envs[@]}"; do export "$kv"; done
+        printf '%s' "$prompt" | claude -p --model "$model" --output-format json $claude_flags "${iso_flags[@]}" "${mf[@]}" "${tf[@]}" 2>"$run/$role.err"
+      )" || { echo "fail $spec" >&2; continue; }
+      [ "$(jq -r '.is_error // false' <<<"$js")" = true ] && { echo "error $spec" >&2; continue; }
+      jq -r '.result' <<<"$js" > "$out"; cost="$(jq '.total_cost_usd // null' <<<"$js")" ;;
+    oai)  # direct OpenAI-compatible call to the gateway: single-turn, no tools (inputs must be in the prompt)
+      # Any OpenAI-compatible endpoint; it may return no cost, so cost stays null. Streamed: keeps long reasoning replies alive.
+      # Reasoning models spend thousands of tokens thinking first, so a small max_tokens leaves no room for the answer.
+      { [ -n "${HARNESS_GW_URL:-}" ] && [ -n "${HARNESS_GW_KEY:-}" ]; } || { echo "fail $spec (set HARNESS_GW_URL and HARNESS_GW_KEY)" >&2; continue; }
+      url_ok "$HARNESS_GW_URL" || { echo "fail $spec (refusing non-https HARNESS_GW_URL)" >&2; continue; }
+      gw_ca=(); [ -n "${HARNESS_GW_CA:-}" ] && gw_ca=(--cacert "$HARNESS_GW_CA")   # optional: only for a gateway with a private CA
+      jq -n --arg m "$model" --rawfile p <(printf '%s' "$prompt") --argjson mt "${HARNESS_OAI_MAX_TOKENS:-32000}" \
+        '{model:$m,max_tokens:$mt,stream:true,messages:[{role:"user",content:$p}]}' > "$run/$role.body.json"
+      curl_auth_cfg "$HARNESS_GW_KEY" | curl -sS -N -K - -m "${HARNESS_OAI_TIMEOUT:-1500}" "${gw_ca[@]}" -D "$run/$role.hdr" "$HARNESS_GW_URL/v1/chat/completions" -H 'content-type: application/json' -d @"$run/$role.body.json" > "$run/$role.sse" 2>"$run/$role.err" || { echo "fail $spec (curl)" >&2; continue; }
+      cost="$(tr -d '\r' < "$run/$role.hdr" 2>/dev/null | awk -F': ' 'tolower($1)=="x-litellm-response-cost"{print $2; exit}')"; [ -n "$cost" ] || cost=null
+      sed -n 's/^data: \({.*\)$/\1/p' "$run/$role.sse" | jq -rj '.choices[0].delta.content // empty' > "$out" 2>/dev/null
+      [ -s "$out" ] || { echo "fail $spec: $(head -1 "$run/$role.hdr" | tr -d '\r'); no answer text (reasoning-only or error): $(head -c 200 "$run/$role.sse")" >&2; continue; } ;;
+    opencode)
+      command -v opencode >/dev/null || { echo "opencode missing, skip $spec" >&2; continue; }
+      printf '%s' "$prompt" | env -u HARNESS_GW_KEY -u HARNESS_CP_KEY_FILE opencode run -m "$model" > "$out" 2>"$run/$role.err" || { echo "fail $spec" >&2; continue; } ;;
+    *) echo "unknown backend $spec" >&2; continue ;;
+  esac
+  [ -s "$out" ] || { echo "empty output $spec" >&2; continue; }
+  jq -nc --arg wf "${HARNESS_WORKFLOW:-dev}" --arg role "$role" --arg spec "$spec" --arg fam "$fam" --argjson cost "$cost" --argjson secs "$(( $(date +%s)-t0 ))" --arg run "$run" \
+    --argjson sk "$(printf '%s\n' "${skipped[@]:-}" | jq -R . | jq -sc 'map(select(length>0))')" --argjson pok "$pok" \
+    '{ts:(now|todate),role:$role,workflow:$wf,served:$spec,family:$fam,cost_usd:$cost,secs:$secs,run:$run,skipped:$sk,principles:$pok}' | tee "$run/$role.meta" >> "$H/log.jsonl"
+  grep -E '^VERDICT:' "$out" | tail -1
+  exit 0
+done
+echo "ALL BACKENDS FAILED/SKIPPED for $role (independence rule or outage) -- not falling back silently" >&2
+exit 1

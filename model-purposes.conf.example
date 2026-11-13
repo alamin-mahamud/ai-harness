@@ -1,0 +1,11 @@
+# alias = why this model sits behind this name (shown by `harness-report models`)
+# Edit freely: this file is documentation for humans, it does not change routing.
+# Routing lives in your LiteLLM/cliproxy config and in roles.conf.
+
+default          = General cheap workhorse for bulk, low-stakes calls.
+reviewer         = Harness code review. Independent of the coder's family by rule (role.avoid).
+
+# Claude models: claude:<model> = direct Claude login, cp:<model> = Claude Code through your proxy.
+claude:sonnet    = Harness coder; planner fallback.
+claude:haiku     = Harness fallback for critic/reviewer/chores. Cheapest Claude.
+claude:opus      = Default critic, planner, reviewer and auditor model (Claude Opus). Also manual escalation (HARNESS_OVERRIDE).

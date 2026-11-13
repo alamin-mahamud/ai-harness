@@ -1,0 +1,7 @@
+# secrets and runtime state: never commit
+*.env
+runs/
+log.jsonl
+# python bytecode (harness-report)
+__pycache__/
+*.pyc

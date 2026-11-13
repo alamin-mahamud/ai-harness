@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""harness-report: see which models run underneath, why, and what they cost.
+
+  harness-report models [DAYS]   alias -> real model -> price -> reason -> observed use (default 7d)
+  harness-report roles  [DAYS]   harness roles: served backend, runs, cost, latency, fallbacks used
+  harness-report spend  [DAYS]   spend per consumer (virtual key) and per workflow tag
+  harness-report all    [DAYS]
+
+`roles` needs only log.jsonl and roles.conf. `models` and `spend` are OPTIONAL: they assume a LiteLLM proxy
+on Kubernetes (ConfigMap + Postgres spend log, read through kubectl/psql, needs PyYAML) and are configured by env:
+  HARNESS_LITELLM_NS (default litellm), HARNESS_LITELLM_CM (litellm-config),
+  HARNESS_PG_NS (= HARNESS_LITELLM_NS), HARNESS_PG_POD (litellm-db-1), HARNESS_PG_CONTAINER (postgres),
+  HARNESS_PG_USER (postgres; use a read-only role). The spend log is read from the database named `litellm`.
+Claude traffic is not in LiteLLM when it goes through a Claude login; `roles` shows it from the harness log.
+"""
+import calendar, collections, json, os, re, subprocess, sys, time
+
+H = os.environ.get("HARNESS_HOME", os.path.expanduser("~/.claude/harness"))
+DAYS = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+CMD = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+
+def sh(*a, inp=None):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, input=inp, timeout=60)
+    except FileNotFoundError:
+        sys.exit(a[0] + " not found: `models` and `spend` need kubectl and a LiteLLM proxy on Kubernetes (see the header of this file)")
+
+
+NS = os.environ.get("HARNESS_LITELLM_NS", "litellm")
+
+
+def psql(db, sql):
+    r = sh("kubectl", "-n", os.environ.get("HARNESS_PG_NS", NS), "exec", os.environ.get("HARNESS_PG_POD", "litellm-db-1"),
+           "-c", os.environ.get("HARNESS_PG_CONTAINER", "postgres"), "--",
+           "psql", "-U", os.environ.get("HARNESS_PG_USER", "postgres"), "-d", db, "-At", "-F", "\t", "-c", sql)
+    if r.returncode:
+        sys.exit("psql failed: " + r.stderr.strip()[:200])
+    return [l.split("\t") for l in r.stdout.splitlines() if l]
+
+
+def table(rows, head, widths=None):
+    rows = [list(map(str, r)) for r in rows]
+    w = widths or [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(head)]
+    line = lambda r: "  ".join(c[:w[i]].ljust(w[i]) for i, c in enumerate(r))
+    print(line(head)); print("  ".join("-" * x for x in w))
+    for r in rows: print(line(r))
+
+
+def purposes():
+    out = {}
+    for l in open(os.path.join(H, "model-purposes.conf")):
+        m = re.match(r"^([\w.:\-]+)\s*=\s*(.+)$", l.strip())
+        if m: out[m.group(1)] = m.group(2)
+    return out
+
+
+def gateway_models():
+    import yaml
+    r = sh("kubectl", "-n", NS, "get", "cm", os.environ.get("HARNESS_LITELLM_CM", "litellm-config"), "-o", "jsonpath={.data.config\\.yaml}")
+    if r.returncode or not r.stdout.strip():
+        sys.exit("cannot read the LiteLLM ConfigMap: " + r.stderr.strip()[:200])
+    cfg = yaml.safe_load(r.stdout)
+    rows = {}
+    for m in cfg["model_list"]:
+        p, mi = m["litellm_params"], m.get("model_info", {})
+        host = "Ollama (local)" if "ollama" in p.get("model", "") or "11434" in p.get("api_base", "") else p.get("api_base", "?")
+        pin, pout = mi.get("input_cost_per_token"), mi.get("output_cost_per_token")
+        price = f"${pin*1e6:.2f}/${pout*1e6:.2f}" if pin is not None else ("free" if host.startswith("Ollama") else "?")
+        rows[m["model_name"]] = (p["model"].split("/", 1)[-1], host, price)
+    fb = (cfg.get("router_settings") or {}).get("fallbacks") or []
+    return rows, fb
+
+
+def cmd_models():
+    why = purposes(); rows, fb = gateway_models()
+    use = {r[0]: r[1:] for r in psql("litellm", f"""
+        select model_group, count(*), coalesce(sum(prompt_tokens),0), coalesce(sum(completion_tokens),0),
+               round(coalesce(sum(spend),0)::numeric,4), count(distinct api_key)
+        from "LiteLLM_SpendLogs" where "startTime" > now() - interval '{DAYS} days' group by 1""")}
+    print(f"\n=== LiteLLM aliases: what runs underneath, why, and use in the last {DAYS}d ===")
+    out = []
+    for a, (model, host, price) in rows.items():
+        u = use.get(a, ["0", "0", "0", "0", "0"])
+        out.append((a, model, host, price, f"{u[0]}", f"{int(u[1])//1000}k/{int(u[2])//1000}k", f"${u[3]}", why.get(a, "(no reason recorded)")))
+    table(out, ["alias", "real model", "provider", "$/M in/out", "calls", "tok in/out", "spend", "why"], [16, 20, 14, 11, 5, 11, 8, 70])
+    if fb: print("\nfallbacks:", "; ".join(f"{k} -> {', '.join(v)}" for d in fb for k, v in d.items()))
+    print("\n=== Outside the gateway (Claude login) ===")
+    sub = [(k, why.get(k, "")) for k in ("claude:sonnet", "claude:haiku", "claude:opus")]
+    table(sub, ["backend", "why"], [14, 110])
+
+
+def cmd_roles():
+    log = os.path.join(H, "log.jsonl")
+    if not os.path.exists(log):
+        sys.exit("no " + log + " yet (harness-run creates it on the first run)")
+    cutoff = time.time() - DAYS * 86400
+    agg = collections.defaultdict(lambda: [0, 0.0, 0.0, 0])
+    chains = {}
+    for l in open(os.path.join(H, "roles.conf")):
+        m = re.match(r"^(\w+)=(.+)$", re.sub(r"\s+#.*$", "", l.strip()))
+        if m and "." not in m.group(1): chains[m.group(1)] = [x.strip() for x in m.group(2).split("|")]
+    for l in open(log):
+        try: d = json.loads(l)
+        except ValueError: continue
+        if calendar.timegm(time.strptime(d["ts"], "%Y-%m-%dT%H:%M:%SZ")) < cutoff: continue
+        a = agg[(d["role"], d.get("workflow", "-"), d["served"])]
+        a[0] += 1; a[1] += d.get("cost_usd") or 0; a[2] += d.get("secs") or 0
+        first = chains.get(d["role"], [d["served"]])[0].split("@")[0].strip()
+        a[3] += 0 if d["served"].split("@")[0] == first else 1
+    print(f"\n=== Harness roles, last {DAYS}d (from log.jsonl) ===")
+    rows = [(r, wf, s, n, f"${c:.4f}", f"{t/n:.0f}s", "yes" if fbk else "") for (r, wf, s), (n, c, t, fbk) in sorted(agg.items())]
+    table(rows, ["role", "workflow", "served by", "runs", "cost", "avg time", "fallback used"]) if rows else print("no runs in window")
+    print("\nconfigured chains:"); [print(f"  {r:9} {' | '.join(c)}") for r, c in chains.items()]
+
+
+def cmd_spend():
+    print(f"\n=== Spend per consumer, last {DAYS}d (LiteLLM) ===")
+    rows = psql("litellm", f"""
+        select coalesce(v.key_alias,'master/unknown'), count(*), round(sum(s.spend)::numeric,4),
+               coalesce(round(avg(s.request_duration_ms)::numeric/1000,1)::text,'-'),
+               coalesce(v.max_budget::text,'-'), round(coalesce(v.spend,0)::numeric,4)
+        from "LiteLLM_SpendLogs" s left join "LiteLLM_VerificationToken" v on v.token = s.api_key
+        where s."startTime" > now() - interval '{DAYS} days' group by v.key_alias, v.max_budget, v.spend order by 3 desc""")
+    table(rows, ["consumer (key)", "calls", f"spend {DAYS}d", "avg secs", "budget", "spent this period"])
+    print(f"\n=== Spend per workflow/role tag, last {DAYS}d ===")
+    rows = psql("litellm", f"""
+        select t, count(*), round(sum(spend)::numeric,5)
+        from "LiteLLM_SpendLogs", jsonb_array_elements_text(request_tags::jsonb) t
+        where "startTime" > now() - interval '{DAYS} days' and t not like 'User-Agent%' group by t order by 3 desc""")
+    table(rows, ["tag", "calls", "spend"]) if rows else print("no tagged calls yet")
+    print("\nclient (User-Agent tag) split:")
+    rows = psql("litellm", f"""
+        select regexp_replace(t,'/.*',''), count(*), round(sum(spend)::numeric,4)
+        from "LiteLLM_SpendLogs", jsonb_array_elements_text(request_tags::jsonb) t
+        where "startTime" > now() - interval '{DAYS} days' and t like 'User-Agent: %/%' group by 1 order by 3 desc""")
+    table(rows, ["client", "calls", "spend"])
+
+
+for f in {"models": [cmd_models], "roles": [cmd_roles], "spend": [cmd_spend], "all": [cmd_models, cmd_roles, cmd_spend]}.get(CMD, [lambda: sys.exit(__doc__)]):
+    f()
